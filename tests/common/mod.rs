@@ -1,6 +1,10 @@
 //! Shared test scaffolding: a dynamic wiremock responder that judges lines
 //! by a simple rule (does the line contain a marker word?), and a
 //! `jevgrep` command builder that never touches the real environment.
+//!
+//! The request body is jev's block-log shape: `state.log` is one text
+//! block, one row per line -- `<id>| <text>` for a candidate (answered),
+//! `  ~| <text>` for a context-only neighbour (no question, no answer).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,7 +14,7 @@ use serde_json::{json, Value};
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-pub type ScoreFn = Box<dyn Fn(&str) -> (f64, f64) + Send + Sync>;
+pub type ScoreFn = Box<dyn Fn(&str) -> f64 + Send + Sync>;
 
 pub struct Scorer {
     pub calls: AtomicUsize,
@@ -36,9 +40,9 @@ impl Scorer {
             delay_ms: 0,
             score: Box::new(move |line: &str| {
                 if line.to_uppercase().contains(&word.to_uppercase()) {
-                    (0.95, 0.9)
+                    0.95
                 } else {
-                    (0.05, 0.9)
+                    0.05
                 }
             }),
             seen_bodies: Mutex::new(Vec::new()),
@@ -71,26 +75,35 @@ impl Respond for SharedScorer {
             return ResponseTemplate::new(this.fail_status);
         }
 
-        let empty = serde_json::Map::new();
-        let lines = body["state"]["lines"].as_object().unwrap_or(&empty);
+        let log = body["state"]["log"].as_str().unwrap_or("");
+        let questions = body["questions"].as_object().cloned().unwrap_or_default();
         let mut answers = serde_json::Map::new();
-        for (id, entry) in lines {
-            let text = entry["line"].as_str().unwrap_or("");
-            let (p, c) = (this.score)(text);
-            answers.insert(
-                id.clone(),
-                json!({
-                    "type": "choice",
-                    "choice": if p >= 0.5 { "yes" } else { "no" },
-                    "confidence": c,
-                    "probabilities": { "yes": p, "no": 1.0 - p },
-                }),
+        for row in log.split('\n') {
+            if row.is_empty() {
+                continue;
+            }
+            if let Some(text) = row.strip_prefix("  ~| ") {
+                // Context-only row: no id, no question, no answer. Just
+                // make sure nothing in the harness accidentally treats it
+                // as askable.
+                let _ = text;
+                continue;
+            }
+            let (id, text) = row
+                .split_once("| ")
+                .expect("state.log row is not `<id>| <text>` or `  ~| <text>`");
+            assert_eq!(
+                questions[id]["type"], "noul",
+                "expected a noul question for row {id}"
             );
+            let p = (this.score)(text).clamp(0.0, 1.0);
+            answers.insert(id.to_string(), json!({ "type": "noul", "noul": p }));
         }
+
         let resp = json!({
             "model": "jev-1.13.0",
             "answers": answers,
-            "usage": { "input_tokens": lines.len() * 20, "output_tokens": lines.len() * 5 },
+            "usage": { "input_tokens": answers.len() * 20, "output_tokens": answers.len() * 5 },
         });
         let mut template = ResponseTemplate::new(200).set_body_json(resp);
         if let Some(marker) = &this.delay_marker {

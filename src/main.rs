@@ -4,6 +4,7 @@ mod judge;
 mod lines;
 mod output;
 mod pipeline;
+mod source;
 mod walk;
 
 use std::io::{IsTerminal, Write};

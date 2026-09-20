@@ -1,17 +1,50 @@
-//! grep-style rendering: prefixes, `-A/-B/-C` grouping with `--`, `-l/-L/-c`,
-//! `--json`, `--stats`, and the `--dry-run` summary.
+//! Streaming grep-style rendering: prefixes, `-A/-B/-C` grouping with `--`,
+//! `-l/-L/-c`, `--json`, `--stats`, and the `--dry-run` summary.
+//!
+//! Unlike the old whole-file renderer, this one sees one line at a time, in
+//! strict order (the caller reorders by sequence number before handing
+//! events here), and never has the whole file in memory: `-B`/`-A` context
+//! is a small ring/countdown instead of a range computed over the full
+//! line list.
+
+use std::collections::VecDeque;
 
 use serde::Serialize;
 
-/// A file's fully-resolved lines, ready to format.
-pub struct FileLines<'a> {
-    pub file_idx: usize,
-    pub label: &'a str,
-    /// Index 0 is line 1.
-    pub raw_by_lineno: &'a [String],
-    /// Lines that passed the match decision (threshold, possibly inverted),
-    /// sorted ascending by line number.
-    pub matched: &'a [(u64, f64)],
+/// One item in the ordered event stream, after batching/judging.
+#[derive(Debug, Clone)]
+pub enum EmitItem {
+    FileStart {
+        label: String,
+    },
+    FileEnd,
+    /// `verdict`: `Some(p)` means the line passed the match/invert
+    /// decision (a real match: printed with `:`, counted, `--json`-able).
+    /// `None` covers everything else -- a judged non-match, a blank/free
+    /// line under normal polarity, or a line that got no answer at all
+    /// (batch error / missing answer: never printed as a match, never
+    /// counted, but still a real physical line eligible as `-A`/`-B`
+    /// context, exactly like the old whole-file renderer treated it).
+    /// `judged`: false for a blank/free line (never sent to jev), true for
+    /// everything else -- used only for `--stats`' judged/free split.
+    Line {
+        lineno: u64,
+        raw: String,
+        verdict: Option<f64>,
+        judged: bool,
+    },
+    Stopped {
+        flag: &'static str,
+        limit: usize,
+        files_not_searched: Option<usize>,
+    },
+    /// A placeholder for a `seq` that was allocated but deliberately never
+    /// became real content (the line that tripped `--max-lines`, or a line
+    /// read after the bound tripped but before the source noticed). The
+    /// reorder buffer requires every allocated `seq` to eventually arrive
+    /// here exactly once -- a `seq` with nothing ever sent for it would
+    /// leave a permanent gap and stall every later event forever.
+    Skip,
 }
 
 pub struct FormatParams {
@@ -20,115 +53,10 @@ pub struct FormatParams {
     pub show_score: bool,
     pub before_ctx: usize,
     pub after_ctx: usize,
-}
-
-/// Tracks output-ordering state across files so `--` separators are printed
-/// correctly even at file boundaries.
-#[derive(Default)]
-pub struct Printer {
-    last: Option<(usize, u64)>,
-    first_group: bool,
-}
-
-impl Printer {
-    pub fn new() -> Self {
-        Printer {
-            last: None,
-            first_group: true,
-        }
-    }
-
-    /// Print every matched line in this file, with `-A/-B/-C` context,
-    /// merging overlapping/adjacent windows and separating non-contiguous
-    /// groups with `--`.
-    pub fn print_file(&mut self, f: &FileLines, p: &FormatParams) {
-        if f.matched.is_empty() {
-            return;
-        }
-        let n = f.raw_by_lineno.len() as u64;
-        let matched_set: std::collections::HashSet<u64> =
-            f.matched.iter().map(|(ln, _)| *ln).collect();
-        let prob_by_line: std::collections::HashMap<u64, f64> = f.matched.iter().cloned().collect();
-
-        // Expand each match into a context range, then merge.
-        let mut ranges: Vec<(u64, u64)> = f
-            .matched
-            .iter()
-            .map(|(ln, _)| {
-                let start = ln.saturating_sub(p.before_ctx as u64).max(1);
-                let end = (ln + p.after_ctx as u64).min(n);
-                (start, end)
-            })
-            .collect();
-        ranges.sort_unstable();
-        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
-        for (start, end) in ranges {
-            if let Some(last) = merged.last_mut() {
-                if start <= last.1 + 1 {
-                    last.1 = last.1.max(end);
-                    continue;
-                }
-            }
-            merged.push((start, end));
-        }
-
-        for (start, end) in merged {
-            let contiguous =
-                matches!(self.last, Some((fi, ln)) if fi == f.file_idx && ln + 1 == start);
-            if !self.first_group && !contiguous {
-                println!("--");
-            }
-            self.first_group = false;
-
-            for lineno in start..=end {
-                let text = &f.raw_by_lineno[(lineno - 1) as usize];
-                let is_match = matched_set.contains(&lineno);
-                let sep = if is_match { ':' } else { '-' };
-
-                let mut out = String::new();
-                if is_match && p.show_score {
-                    let prob = prob_by_line.get(&lineno).copied().unwrap_or(0.0);
-                    out.push_str(&format!("p={prob:.2} "));
-                }
-                if p.show_filename {
-                    out.push_str(f.label);
-                    out.push(sep);
-                }
-                if p.line_number {
-                    out.push_str(&lineno.to_string());
-                    out.push(sep);
-                }
-                out.push_str(text);
-                println!("{out}");
-            }
-            self.last = Some((f.file_idx, end));
-        }
-    }
-}
-
-pub fn file_has_match(f: &FileLines) -> bool {
-    !f.matched.is_empty()
-}
-
-pub fn print_files_with_matches(f: &FileLines) {
-    if file_has_match(f) {
-        println!("{}", f.label);
-    }
-}
-
-pub fn print_files_without_match(f: &FileLines) {
-    if !file_has_match(f) {
-        println!("{}", f.label);
-    }
-}
-
-pub fn print_count(f: &FileLines, show_filename: bool) {
-    let count = f.matched.len();
-    if show_filename {
-        println!("{}:{}", f.label, count);
-    } else {
-        println!("{count}");
-    }
+    pub json: bool,
+    pub files_with_matches: bool,
+    pub files_without_match: bool,
+    pub count: bool,
 }
 
 #[derive(Serialize)]
@@ -139,19 +67,192 @@ struct JsonLine<'a> {
     probability: f64,
 }
 
-pub fn print_json(f: &FileLines) {
-    for &(lineno, probability) in f.matched {
-        let text = &f.raw_by_lineno[(lineno - 1) as usize];
-        let j = JsonLine {
-            file: f.label,
-            lineno,
-            line: text,
-            probability,
-        };
-        if let Ok(s) = serde_json::to_string(&j) {
-            println!("{s}");
+/// Streaming printer/accumulator: consumes `EmitItem`s strictly in order
+/// and prints incrementally (or, for `-l/-L/-c`, at each `FileEnd`).
+pub struct Printer {
+    fmt: FormatParams,
+
+    current_label: String,
+    file_gen: u64,
+    file_has_match: bool,
+    file_match_count: u64,
+
+    before_ring: VecDeque<(u64, String)>,
+    after_remaining: usize,
+    last_printed: Option<(u64, u64)>, // (file_gen, lineno)
+    first_group: bool,
+
+    pub files_seen: u64,
+    pub lines_seen: u64,
+    pub judged: u64,
+    pub free: u64,
+    pub had_stop: bool,
+}
+
+impl Printer {
+    pub fn new(fmt: FormatParams) -> Self {
+        Printer {
+            fmt,
+            current_label: String::new(),
+            file_gen: 0,
+            file_has_match: false,
+            file_match_count: 0,
+            before_ring: VecDeque::new(),
+            after_remaining: 0,
+            last_printed: None,
+            first_group: true,
+            files_seen: 0,
+            lines_seen: 0,
+            judged: 0,
+            free: 0,
+            had_stop: false,
         }
     }
+
+    /// Handle one event; returns 1 if it was a counted match, else 0 (so
+    /// the caller can accumulate `total_matches`).
+    pub fn handle(&mut self, item: EmitItem) -> u64 {
+        match item {
+            EmitItem::Skip => 0,
+            EmitItem::FileStart { label } => {
+                self.current_label = label;
+                self.file_gen += 1;
+                self.file_has_match = false;
+                self.file_match_count = 0;
+                self.before_ring.clear();
+                self.after_remaining = 0;
+                self.files_seen += 1;
+                0
+            }
+            EmitItem::FileEnd => {
+                if self.fmt.files_with_matches {
+                    if self.file_has_match {
+                        println!("{}", self.current_label);
+                    }
+                } else if self.fmt.files_without_match {
+                    if !self.file_has_match {
+                        println!("{}", self.current_label);
+                    }
+                } else if self.fmt.count {
+                    if self.fmt.show_filename {
+                        println!("{}:{}", self.current_label, self.file_match_count);
+                    } else {
+                        println!("{}", self.file_match_count);
+                    }
+                }
+                0
+            }
+            EmitItem::Stopped {
+                flag,
+                limit,
+                files_not_searched,
+            } => {
+                self.had_stop = true;
+                let detail = match files_not_searched {
+                    Some(n) => format!("{n} files not searched"),
+                    None => "input not fully read".to_string(),
+                };
+                eprintln!(
+                    "jevgrep: stopped at {flag} {limit} ({detail}); raise the limit or narrow with -g"
+                );
+                0
+            }
+            EmitItem::Line {
+                lineno,
+                raw,
+                verdict,
+                judged,
+            } => {
+                self.lines_seen += 1;
+                if judged {
+                    self.judged += 1;
+                } else {
+                    self.free += 1;
+                }
+                let is_match = verdict.is_some();
+                if is_match {
+                    self.file_has_match = true;
+                    self.file_match_count += 1;
+                }
+
+                if self.fmt.json {
+                    if let Some(p) = verdict {
+                        let j = JsonLine {
+                            file: &self.current_label,
+                            lineno,
+                            line: &raw,
+                            probability: p,
+                        };
+                        if let Ok(s) = serde_json::to_string(&j) {
+                            println!("{s}");
+                        }
+                    }
+                    return is_match as u64;
+                }
+                if self.fmt.files_with_matches || self.fmt.files_without_match || self.fmt.count {
+                    return is_match as u64;
+                }
+
+                // Normal grep-style rendering with -A/-B/-C.
+                if is_match {
+                    self.flush_before(&raw, lineno);
+                    self.print_line(lineno, &raw, true, verdict);
+                    self.after_remaining = self.fmt.after_ctx;
+                    self.before_ring.clear();
+                } else if self.after_remaining > 0 {
+                    self.print_line(lineno, &raw, false, None);
+                    self.after_remaining -= 1;
+                } else if self.fmt.before_ctx > 0 {
+                    self.before_ring.push_back((lineno, raw));
+                    if self.before_ring.len() > self.fmt.before_ctx {
+                        self.before_ring.pop_front();
+                    }
+                }
+                is_match as u64
+            }
+        }
+    }
+
+    fn flush_before(&mut self, _current_raw: &str, _current_lineno: u64) {
+        let ring = std::mem::take(&mut self.before_ring);
+        for (lineno, raw) in ring {
+            self.print_line(lineno, &raw, false, None);
+        }
+    }
+
+    fn print_line(&mut self, lineno: u64, raw: &str, is_match: bool, verdict: Option<f64>) {
+        let contiguous =
+            matches!(self.last_printed, Some((g, ln)) if g == self.file_gen && ln + 1 == lineno);
+        if !self.first_group && !contiguous {
+            println!("--");
+        }
+        self.first_group = false;
+
+        let sep = if is_match { ':' } else { '-' };
+        let mut out = String::new();
+        if is_match && self.fmt.show_score {
+            let p = verdict.unwrap_or(0.0);
+            out.push_str(&format!("p={p:.2} "));
+        }
+        if self.fmt.show_filename {
+            out.push_str(&self.current_label);
+            out.push(sep);
+        }
+        if self.fmt.line_number {
+            out.push_str(&lineno.to_string());
+            out.push(sep);
+        }
+        out.push_str(raw);
+        println!("{out}");
+
+        self.last_printed = Some((self.file_gen, lineno));
+    }
+
+    /// Nothing to flush at run end: every printed line is emitted as soon
+    /// as its file-relative position is known (context is never held past
+    /// the point it's needed), so this is a no-op kept for symmetry/
+    /// future use.
+    pub fn finish(&mut self) {}
 }
 
 /// Insert thousands separators, e.g. 61340 -> "61,340".
@@ -191,12 +292,6 @@ pub fn print_stats(
         grouped(input_tokens),
         grouped(output_tokens),
         elapsed_secs,
-    );
-}
-
-pub fn print_stop_message(flag: &str, limit: usize, remaining: usize) {
-    eprintln!(
-        "jevgrep: stopped at {flag} {limit} ({remaining} files not searched); raise the limit or narrow with -g"
     );
 }
 

@@ -476,11 +476,13 @@ impl Judge {
                         return Ok(out);
                     } else if status.as_u16() == 401 {
                         return Err(AskError::Other(BatchError::fatal(format!(
-                            "TypeSafe API rejected the key (HTTP {status})"
+                            "TypeSafe API rejected the key (HTTP {})",
+                            status.as_u16()
                         ))));
                     } else if status.as_u16() == 429 || status.as_u16() == 529 {
                         last_err = Some(BatchError::new(format!(
-                            "TypeSafe API error (HTTP {status})"
+                            "TypeSafe API error (HTTP {})",
+                            status.as_u16()
                         )));
                     } else {
                         // The body is the useful part of a 4xx: e.g.
@@ -491,7 +493,9 @@ impl Judge {
                         }
                         let detail = api_error_detail(&body);
                         return Err(AskError::Other(BatchError::new(format!(
-                            "TypeSafe API error (HTTP {status}){detail}"
+                            "TypeSafe API error (HTTP {}){}",
+                            status.as_u16(),
+                            detail
                         ))));
                     }
                 }
@@ -508,9 +512,9 @@ impl Judge {
             }
         }
 
-        Err(AskError::Other(
-            last_err.unwrap_or_else(|| BatchError::new("TypeSafe API request failed")),
-        ))
+        Err(AskError::Other(last_err.unwrap_or_else(|| {
+            BatchError::new("TypeSafe API request failed")
+        })))
     }
 }
 

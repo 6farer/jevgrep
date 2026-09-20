@@ -73,13 +73,7 @@ async fn threshold_controls_the_cutoff() {
         fail_status: 200,
         delay_marker: None,
         delay_ms: 0,
-        score: Box::new(|line: &str| {
-            if line.contains("HIGH") {
-                (0.6, 0.9)
-            } else {
-                (0.3, 0.9)
-            }
-        }),
+        score: Box::new(|line: &str| if line.contains("HIGH") { 0.6 } else { 0.3 }),
         seen_bodies: std::sync::Mutex::new(Vec::new()),
     });
     let server = start(scorer).await;
@@ -239,7 +233,10 @@ async fn json_output_has_expected_fields() {
     assert_eq!(v["lineno"], 1);
     assert_eq!(v["line"], "a MATCH line");
     assert!(v["probability"].as_f64().unwrap() >= 0.5);
-    assert!(v["confidence"].as_f64().is_some());
+    assert!(
+        v.get("confidence").is_none(),
+        "confidence was removed: {v:?}"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -257,13 +254,7 @@ async fn output_order_survives_a_delayed_first_batch() {
         fail_status: 200,
         delay_marker: Some("first ITEM".to_string()),
         delay_ms: 300,
-        score: Box::new(|line: &str| {
-            if line.contains("ITEM") {
-                (0.9, 0.9)
-            } else {
-                (0.1, 0.9)
-            }
-        }),
+        score: Box::new(|line: &str| if line.contains("ITEM") { 0.9 } else { 0.1 }),
         seen_bodies: std::sync::Mutex::new(Vec::new()),
     });
     let server = start(scorer).await;
@@ -284,35 +275,72 @@ async fn output_order_survives_a_delayed_first_batch() {
 #[tokio::test(flavor = "multi_thread")]
 async fn judge_context_is_sent_in_the_request() {
     let dir = tempdir().unwrap();
-    fs::write(
-        dir.path().join("f.txt"),
-        "one\ntwo\nMATCH three\nfour\nfive\n",
-    )
-    .unwrap();
+    fs::write(dir.path().join("f.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
 
-    let scorer = Scorer::matching("MATCH");
+    // With --judge-context 1 and --batch 2, a 5-line file dispatches in
+    // three requests (lines 1-2, 3-4, 5), each carrying up to one leading
+    // and one trailing `  ~| ` context row from its neighbours. The
+    // second request (lines 3-4) has both: a before row (line 2) and an
+    // after row (line 5).
+    let scorer = Scorer::matching("NEVER-MATCHES");
     let server = start(scorer.clone()).await;
 
     base_cmd(&server)
         .current_dir(dir.path())
-        .args(["q", "f.txt", "--judge-context", "1"])
+        .args([
+            "q",
+            "f.txt",
+            "--judge-context",
+            "1",
+            "--batch",
+            "2",
+            "-j",
+            "1",
+        ])
         .assert()
-        .code(0);
+        .code(1); // nothing matches this query -> exit 1, not an error
 
     let bodies = scorer.bodies();
-    let mut found = false;
-    for body in &bodies {
-        if let Some(lines) = body["state"]["lines"].as_object() {
-            for (_, entry) in lines {
-                if entry["line"] == "MATCH three" {
-                    found = true;
-                    assert_eq!(entry["before"], serde_json::json!(["two"]));
-                    assert_eq!(entry["after"], serde_json::json!(["four"]));
-                }
-            }
-        }
+    assert!(
+        bodies.len() >= 2,
+        "expected at least 2 requests, got {}: {bodies:?}",
+        bodies.len()
+    );
+    let second_log = bodies[1]["state"]["log"].as_str().unwrap_or("");
+    let context_rows: Vec<&str> = second_log
+        .lines()
+        .filter(|l| l.starts_with("  ~| "))
+        .collect();
+    assert_eq!(
+        context_rows.len(),
+        2,
+        "expected one before and one after context row in the second request, got: {second_log:?}"
+    );
+
+    // With --judge-context 0, no context rows ever appear, in any request.
+    let scorer0 = Scorer::matching("NEVER-MATCHES");
+    let server0 = start(scorer0.clone()).await;
+    base_cmd(&server0)
+        .current_dir(dir.path())
+        .args([
+            "q",
+            "f.txt",
+            "--judge-context",
+            "0",
+            "--batch",
+            "2",
+            "-j",
+            "1",
+        ])
+        .assert()
+        .code(1);
+    for body in scorer0.bodies() {
+        let log = body["state"]["log"].as_str().unwrap_or("");
+        assert!(
+            !log.contains("  ~| "),
+            "no context rows expected with --judge-context 0: {log:?}"
+        );
     }
-    assert!(found, "expected to find the judged line in a request body");
 }
 
 // ---------------------------------------------------------------------
@@ -573,13 +601,7 @@ async fn retries_on_429_then_succeeds() {
         fail_status: 429,
         delay_marker: None,
         delay_ms: 0,
-        score: Box::new(|line: &str| {
-            if line.contains("MATCH") {
-                (0.9, 0.9)
-            } else {
-                (0.1, 0.9)
-            }
-        }),
+        score: Box::new(|line: &str| if line.contains("MATCH") { 0.9 } else { 0.1 }),
         seen_bodies: std::sync::Mutex::new(Vec::new()),
     });
     let server = start(scorer.clone()).await;
@@ -605,7 +627,7 @@ async fn readable_401_message_no_retry() {
         fail_status: 401,
         delay_marker: None,
         delay_ms: 0,
-        score: Box::new(|_: &str| (0.9, 0.9)),
+        score: Box::new(|_: &str| 0.9),
         seen_bodies: std::sync::Mutex::new(Vec::new()),
     });
     let server = start(scorer.clone()).await;
@@ -635,7 +657,7 @@ async fn rejected_key_aborts_whole_run() {
         fail_status: 401,
         delay_marker: None,
         delay_ms: 0,
-        score: Box::new(|_: &str| (0.9, 0.9)),
+        score: Box::new(|_: &str| 0.9),
         seen_bodies: std::sync::Mutex::new(Vec::new()),
     });
     let server = start(scorer.clone()).await;
@@ -689,9 +711,10 @@ async fn missing_api_key_exits_2_with_exact_message() {
     let mut cmd = base_cmd(&server);
     cmd.env_remove("TYPESAFE_API_KEY");
     cmd.current_dir(dir.path()).args(["q", "."]);
-    cmd.assert()
-        .code(2)
-        .stderr("jevgrep: TYPESAFE_API_KEY is not set (env or ./.env)\n");
+    cmd.assert().code(2).stderr(
+        "jevgrep: missing API key: run `jevgrep config set-key`, or set TYPESAFE_API_KEY \
+             (environment or .env)\n",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
