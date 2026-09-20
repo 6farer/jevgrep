@@ -1,0 +1,135 @@
+//! Shared test scaffolding: a dynamic wiremock responder that judges lines
+//! by a simple rule (does the line contain a marker word?), and a
+//! `jevgrep` command builder that never touches the real environment.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use assert_cmd::Command;
+use serde_json::{json, Value};
+use wiremock::matchers::method;
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+pub type ScoreFn = Box<dyn Fn(&str) -> (f64, f64) + Send + Sync>;
+
+pub struct Scorer {
+    pub calls: AtomicUsize,
+    pub fail_first_n: usize,
+    pub fail_status: u16,
+    /// Requests whose raw JSON body contains this substring get delayed by
+    /// `delay_ms` before responding (used to prove ordering survives an
+    /// out-of-order batch completion).
+    pub delay_marker: Option<String>,
+    pub delay_ms: u64,
+    pub score: ScoreFn,
+    pub seen_bodies: Mutex<Vec<Value>>,
+}
+
+impl Scorer {
+    pub fn matching(word: &str) -> Arc<Self> {
+        let word = word.to_string();
+        Arc::new(Scorer {
+            calls: AtomicUsize::new(0),
+            fail_first_n: 0,
+            fail_status: 200,
+            delay_marker: None,
+            delay_ms: 0,
+            score: Box::new(move |line: &str| {
+                if line.to_uppercase().contains(&word.to_uppercase()) {
+                    (0.95, 0.9)
+                } else {
+                    (0.05, 0.9)
+                }
+            }),
+            seen_bodies: Mutex::new(Vec::new()),
+        })
+    }
+
+    pub fn request_count(&self) -> usize {
+        self.seen_bodies.lock().unwrap().len()
+    }
+
+    pub fn bodies(&self) -> Vec<Value> {
+        self.seen_bodies.lock().unwrap().clone()
+    }
+}
+
+/// Local newtype so we can implement the foreign `Respond` trait for a
+/// shared `Arc<Scorer>` (the orphan rules forbid implementing a foreign
+/// trait directly for `Arc<Scorer>`).
+#[derive(Clone)]
+pub struct SharedScorer(pub Arc<Scorer>);
+
+impl Respond for SharedScorer {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let this = &self.0;
+        let body: Value = serde_json::from_slice(&request.body).unwrap_or(json!({}));
+        this.seen_bodies.lock().unwrap().push(body.clone());
+
+        let n = this.calls.fetch_add(1, Ordering::SeqCst);
+        if n < this.fail_first_n {
+            return ResponseTemplate::new(this.fail_status);
+        }
+
+        let empty = serde_json::Map::new();
+        let lines = body["state"]["lines"].as_object().unwrap_or(&empty);
+        let mut answers = serde_json::Map::new();
+        for (id, entry) in lines {
+            let text = entry["line"].as_str().unwrap_or("");
+            let (p, c) = (this.score)(text);
+            answers.insert(
+                id.clone(),
+                json!({
+                    "type": "choice",
+                    "choice": if p >= 0.5 { "yes" } else { "no" },
+                    "confidence": c,
+                    "probabilities": { "yes": p, "no": 1.0 - p },
+                }),
+            );
+        }
+        let resp = json!({
+            "model": "jev-1.13.0",
+            "answers": answers,
+            "usage": { "input_tokens": lines.len() * 20, "output_tokens": lines.len() * 5 },
+        });
+        let mut template = ResponseTemplate::new(200).set_body_json(resp);
+        if let Some(marker) = &this.delay_marker {
+            let body_str = serde_json::to_string(&body).unwrap_or_default();
+            if body_str.contains(marker.as_str()) {
+                template = template.set_delay(std::time::Duration::from_millis(this.delay_ms));
+            }
+        }
+        template
+    }
+}
+
+pub async fn start(scorer: Arc<Scorer>) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(SharedScorer(scorer))
+        .mount(&server)
+        .await;
+    server
+}
+
+pub fn api_url(server: &MockServer) -> String {
+    format!("{}/v1/systemone", server.uri())
+}
+
+/// A `jevgrep` command with a fake key, the mock server URL, and no access
+/// to the real environment (in particular, never the crate root's real
+/// `.env`/`TYPESAFE_API_KEY`). Callers must set `.current_dir(...)`.
+pub fn base_cmd(server: &MockServer) -> Command {
+    let mut cmd = Command::cargo_bin("jevgrep").unwrap();
+    cmd.env_clear();
+    if let Ok(path) = std::env::var("PATH") {
+        cmd.env("PATH", path);
+    }
+    cmd.env("TYPESAFE_API_KEY", "test");
+    cmd.env("JEVGREP_API_URL", api_url(server));
+    cmd
+}
+
+pub fn fixtures_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
+}
