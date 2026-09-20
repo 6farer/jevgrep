@@ -27,18 +27,9 @@ use crate::walk::{self, FileArg};
 
 #[derive(Debug, Clone)]
 pub enum Event {
-    FileStart {
-        file_idx: usize,
-        label: String,
-    },
-    Line {
-        file_idx: usize,
-        lineno: u64,
-        raw: String,
-    },
-    FileEnd {
-        file_idx: usize,
-    },
+    FileStart { label: String },
+    Line { lineno: u64, raw: String },
+    FileEnd,
 }
 
 /// First-stop-wins record of which bound tripped. Whichever side (source,
@@ -151,7 +142,7 @@ pub async fn run(
         match arg {
             FileArg::Stdin => {
                 files_opened += 1;
-                if run_stdin(idx, &label, &tx, &seq, &shutdown).await.is_err() {
+                if run_stdin(&label, &tx, &seq, &shutdown).await.is_err() {
                     return;
                 }
             }
@@ -192,7 +183,6 @@ pub async fn run(
                     &tx,
                     &seq,
                     Event::FileStart {
-                        file_idx: idx,
                         label: label.clone(),
                     },
                 )
@@ -207,25 +197,11 @@ pub async fn run(
                         break;
                     }
                     let lineno = (i + 1) as u64;
-                    if send(
-                        &tx,
-                        &seq,
-                        Event::Line {
-                            file_idx: idx,
-                            lineno,
-                            raw,
-                        },
-                    )
-                    .await
-                    .is_err()
-                    {
+                    if send(&tx, &seq, Event::Line { lineno, raw }).await.is_err() {
                         return;
                     }
                 }
-                if send(&tx, &seq, Event::FileEnd { file_idx: idx })
-                    .await
-                    .is_err()
-                {
+                if send(&tx, &seq, Event::FileEnd).await.is_err() {
                     return;
                 }
             }
@@ -238,7 +214,6 @@ pub async fn run(
 /// this is what makes a live pipe (`tail -f x | jevgrep q`) print matches
 /// before the producer finishes, rather than only after EOF.
 async fn run_stdin(
-    file_idx: usize,
     label: &str,
     tx: &Sender<(u64, Event)>,
     seq: &Arc<AtomicU64>,
@@ -248,7 +223,6 @@ async fn run_stdin(
         tx,
         seq,
         Event::FileStart {
-            file_idx,
             label: label.to_string(),
         },
     )
@@ -277,7 +251,6 @@ async fn run_stdin(
                 tx,
                 seq,
                 Event::Line {
-                    file_idx,
                     lineno,
                     raw: decode(line),
                 },
@@ -297,7 +270,6 @@ async fn run_stdin(
             tx,
             seq,
             Event::Line {
-                file_idx,
                 lineno,
                 raw: decode(line),
             },
@@ -305,5 +277,5 @@ async fn run_stdin(
         .await;
     }
 
-    send(tx, seq, Event::FileEnd { file_idx }).await
+    send(tx, seq, Event::FileEnd).await
 }

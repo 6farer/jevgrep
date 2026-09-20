@@ -418,7 +418,7 @@ async fn run_batcher(mut rx_lines: mpsc::Receiver<(u64, Event)>, ctx: Arc<Ctx>) 
                                     return;
                                 }
                             }
-                            Event::FileEnd { .. } => {
+                            Event::FileEnd => {
                                 close_and_dispatch(&mut window, &ctx, true).await;
                                 deadline = None;
                                 if ctx.tx_emit.send((seq, EmitItem::FileEnd)).await.is_err() {

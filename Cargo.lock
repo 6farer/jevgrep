@@ -772,7 +772,6 @@ dependencies = [
  "assert_cmd",
  "clap",
  "dotenvy",
- "futures",
  "globset",
  "ignore",
  "predicates",

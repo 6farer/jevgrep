@@ -8,7 +8,7 @@ mod source;
 mod walk;
 
 use std::io::{IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -147,15 +147,10 @@ async fn main() {
         cli.no_cache,
     ));
 
+    // pipeline::run installs its own Ctrl-C listener (which also sets
+    // `had_error`/`abort` and notifies the batcher); a second listener here
+    // would be redundant.
     let shutdown = Arc::new(AtomicBool::new(false));
-    {
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                shutdown.store(true, Ordering::Relaxed);
-            }
-        });
-    }
 
     let outcome = match pipeline::run(&cli, judge, shutdown).await {
         Ok(o) => o,
