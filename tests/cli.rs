@@ -209,6 +209,22 @@ async fn context_grouping_separates_with_double_dash() {
     assert_eq!(stdout, expected);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn no_separator_without_context_flags() {
+    // grep only prints `--` between groups when -A/-B/-C is in effect.
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("f.txt"), "a MATCH\nx\ny\nb MATCH\n").unwrap();
+    let scorer = Scorer::matching("MATCH");
+    let server = start(scorer).await;
+    let out = base_cmd(&server)
+        .current_dir(dir.path())
+        .args(["q", "f.txt"])
+        .assert()
+        .code(0);
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert_eq!(stdout, "a MATCH\nb MATCH\n");
+}
+
 // ---------------------------------------------------------------------
 // --json
 // ---------------------------------------------------------------------

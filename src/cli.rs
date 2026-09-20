@@ -84,9 +84,10 @@ pub struct Cli {
     #[arg(short = 'v', long, help_heading = "Judging")]
     pub invert_match: bool,
 
-    /// Lines before/after each line sent to jev as context (0 = judge in
-    /// isolation).
-    #[arg(long, default_value_t = 2, value_name = "N", help_heading = "Judging")]
+    /// Lines before/after each candidate sent to jev as context. Off by
+    /// default: on log lines, neighbours measurably lower match scores and
+    /// add ~25% tokens. Useful for code or other multi-line structures.
+    #[arg(long, default_value_t = 0, value_name = "N", help_heading = "Judging")]
     pub judge_context: usize,
 
     /// Max lines per API request.

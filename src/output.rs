@@ -223,7 +223,10 @@ impl Printer {
     fn print_line(&mut self, lineno: u64, raw: &str, is_match: bool, verdict: Option<f64>) {
         let contiguous =
             matches!(self.last_printed, Some((g, ln)) if g == self.file_gen && ln + 1 == lineno);
-        if !self.first_group && !contiguous {
+        // grep prints the `--` group separator only when context lines are
+        // being shown; plain match output is never interleaved with it.
+        let showing_context = self.fmt.before_ctx > 0 || self.fmt.after_ctx > 0;
+        if showing_context && !self.first_group && !contiguous {
             println!("--");
         }
         self.first_group = false;
