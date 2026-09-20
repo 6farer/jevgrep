@@ -146,3 +146,26 @@ pub fn base_cmd(server: &MockServer) -> Command {
 pub fn fixtures_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
 }
+
+/// Parse a `state.log` block into its candidate rows (`(id, text)`, `id`
+/// starting with `L`) and its context-only row texts (`  ~| <text>`, no
+/// id), in the order they appear.
+pub fn parse_log(log: &str) -> (Vec<(String, String)>, Vec<String>) {
+    let mut candidates = Vec::new();
+    let mut context = Vec::new();
+    for row in log.split('\n') {
+        if row.is_empty() {
+            continue;
+        }
+        if let Some(text) = row.strip_prefix("  ~| ") {
+            context.push(text.to_string());
+            continue;
+        }
+        if let Some((id, text)) = row.split_once("| ") {
+            if id.starts_with('L') {
+                candidates.push((id.to_string(), text.to_string()));
+            }
+        }
+    }
+    (candidates, context)
+}

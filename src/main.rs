@@ -8,7 +8,6 @@ mod source;
 mod walk;
 
 use std::io::{IsTerminal, Write};
-use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -114,7 +113,7 @@ fn run_config(action: ConfigAction) -> ! {
 }
 
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn main() {
     // Load .env from the current directory, without overriding real
     // environment variables that are already set.
     let _ = dotenvy::dotenv();
@@ -135,7 +134,7 @@ async fn main() -> ExitCode {
         }
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();
-        return ExitCode::from(0);
+        std::process::exit(0);
     }
 
     let api_key = resolve_api_key();
@@ -174,5 +173,9 @@ async fn main() -> ExitCode {
         1
     };
 
-    ExitCode::from(code)
+    // A plain `-> ExitCode` return can leave the runtime waiting to join
+    // every spawned task -- including the stdin reader, which can be
+    // parked in an uninterruptible blocking read after Ctrl-C -- before the
+    // process actually exits. Exiting directly terminates immediately.
+    std::process::exit(code);
 }

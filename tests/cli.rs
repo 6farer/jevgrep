@@ -5,7 +5,7 @@ use std::fs;
 use predicates::prelude::*;
 use tempfile::tempdir;
 
-use common::{base_cmd, fixtures_dir, start, Scorer};
+use common::{base_cmd, fixtures_dir, parse_log, start, Scorer};
 
 // ---------------------------------------------------------------------
 // Basic filtering, filename/lineno prefixes, auto-filename rule
@@ -364,9 +364,10 @@ async fn identical_lines_are_deduped_before_asking() {
 
     let bodies = scorer.bodies();
     assert_eq!(bodies.len(), 1, "expected everything to fit one request");
-    let lines = bodies[0]["state"]["lines"].as_object().unwrap();
+    let log = bodies[0]["state"]["log"].as_str().unwrap_or("");
+    let (candidates, _context) = parse_log(log);
     // 5 duplicate "dup MATCH" + 2 distinct lines => 3 unique asks, not 7.
-    assert_eq!(lines.len(), 3);
+    assert_eq!(candidates.len(), 3, "log was: {log:?}");
 }
 
 // ---------------------------------------------------------------------
@@ -388,16 +389,22 @@ async fn blank_lines_are_never_sent_to_jev() {
         .code(0);
 
     let bodies = scorer.bodies();
-    let total_asked: usize = bodies
-        .iter()
-        .map(|b| {
-            b["state"]["lines"]
-                .as_object()
-                .map(|m| m.len())
-                .unwrap_or(0)
-        })
-        .sum();
-    assert_eq!(total_asked, 2);
+    let mut total_candidates = 0usize;
+    for body in &bodies {
+        let log = body["state"]["log"].as_str().unwrap_or("");
+        let (candidates, context) = parse_log(log);
+        total_candidates += candidates.len();
+        for (id, text) in &candidates {
+            assert!(
+                !text.trim().is_empty(),
+                "blank candidate row {id} sent: {log:?}"
+            );
+        }
+        for text in &context {
+            assert!(!text.trim().is_empty(), "blank context row sent: {log:?}");
+        }
+    }
+    assert_eq!(total_candidates, 2);
 }
 
 // ---------------------------------------------------------------------

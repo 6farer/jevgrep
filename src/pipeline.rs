@@ -17,7 +17,7 @@
 //! context using only a single sliding window, without ever re-reading a
 //! file.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -73,6 +73,13 @@ struct Ctx {
     had_error: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     shutdown_notify: Arc<Notify>,
+    /// Set only for an abort-now shutdown (Ctrl-C, or a fatal/strict worker
+    /// error) -- never for `--max-lines`/`--max-files`, which set
+    /// `shutdown` alone and rely on the channel draining naturally so
+    /// already-buffered file events are never lost. The batcher's top-of-
+    /// loop check and `dispatch_window`'s "don't call the API" check both
+    /// key off this, not `shutdown`.
+    abort: Arc<AtomicBool>,
     semaphore: Arc<Semaphore>,
     stop_cell: Arc<StopCell>,
     remaining_files: Arc<AtomicUsize>,
@@ -111,17 +118,24 @@ pub async fn run(cli: &Cli, judge: Arc<Judge>, shutdown: Arc<AtomicBool>) -> Res
 
     let shutdown_notify = Arc::new(Notify::new());
     let had_error = Arc::new(AtomicBool::new(false));
+    let abort = Arc::new(AtomicBool::new(false));
     let stop_cell = Arc::new(StopCell::new());
 
     // First Ctrl-C: stop accepting new input, drain in-flight work. Second
     // Ctrl-C: give up on draining and exit now (a blocking stdin read can't
-    // otherwise be interrupted).
+    // otherwise be interrupted). A run cut short by Ctrl-C is not a clean
+    // run even if it printed real matches first (same rationale as
+    // --max-lines/--max-files), so it counts as an error for the exit code.
     {
         let shutdown = shutdown.clone();
         let shutdown_notify = shutdown_notify.clone();
+        let had_error = had_error.clone();
+        let abort = abort.clone();
         tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
                 shutdown.store(true, Ordering::Relaxed);
+                had_error.store(true, Ordering::Relaxed);
+                abort.store(true, Ordering::Relaxed);
                 shutdown_notify.notify_one();
             }
             if tokio::signal::ctrl_c().await.is_ok() {
@@ -179,6 +193,7 @@ pub async fn run(cli: &Cli, judge: Arc<Judge>, shutdown: Arc<AtomicBool>) -> Res
         had_error: had_error.clone(),
         shutdown: shutdown.clone(),
         shutdown_notify,
+        abort: abort.clone(),
         semaphore: Arc::new(Semaphore::new(cli.concurrency.max(1))),
         stop_cell,
         remaining_files,
@@ -186,6 +201,20 @@ pub async fn run(cli: &Cli, judge: Arc<Judge>, shutdown: Arc<AtomicBool>) -> Res
     });
 
     let batcher_handle = tokio::spawn(run_batcher(rx_lines, ctx));
+
+    // Once the batcher finishes -- either by draining to a natural close or
+    // by breaking early on an abort -- the source's own work is no longer
+    // useful. On a normal run it has already finished by then; on a
+    // Ctrl-C/fatal-error shutdown it may still be parked in an
+    // uninterruptible blocking stdin read, still holding its own `tx_emit`
+    // clone, which would otherwise keep `rx_emit` (and the loop below) open
+    // forever. Abort it as soon as the batcher is done so the emit channel
+    // actually closes.
+    let source_abort_handle = source_handle.abort_handle();
+    let reaper = tokio::spawn(async move {
+        let _ = batcher_handle.await;
+        source_abort_handle.abort();
+    });
 
     let mut next_expected: u64 = 0;
     let mut pending: BTreeMap<u64, EmitItem> = BTreeMap::new();
@@ -200,9 +229,9 @@ pub async fn run(cli: &Cli, judge: Arc<Judge>, shutdown: Arc<AtomicBool>) -> Res
         }
     }
 
+    let _ = reaper.await;
     source_handle.abort();
     let _ = source_handle.await;
-    let _ = batcher_handle.await;
 
     printer.finish();
 
@@ -298,10 +327,46 @@ impl FileWindow {
     }
 }
 
+/// Insertion-ordered set capped at 10,000 entries (oldest evicted first),
+/// mirroring the judge's own verdict cache cap. Backs the `--max-lines`
+/// "count distinct judge text once" approximation in `run_batcher`; without
+/// a cap this would grow without bound on a long-lived stream.
+const SEEN_TEXTS_CAP: usize = 10_000;
+
+struct SeenTexts {
+    set: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl SeenTexts {
+    fn new() -> Self {
+        SeenTexts {
+            set: HashSet::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    /// Returns `true` the first time `text` is seen (and records it);
+    /// `false` for a repeat.
+    fn insert(&mut self, text: String) -> bool {
+        if self.set.contains(&text) {
+            return false;
+        }
+        if self.order.len() >= SEEN_TEXTS_CAP {
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
+            }
+        }
+        self.order.push_back(text.clone());
+        self.set.insert(text);
+        true
+    }
+}
+
 async fn run_batcher(mut rx_lines: mpsc::Receiver<(u64, Event)>, ctx: Arc<Ctx>) {
     let mut window = FileWindow::new();
     let mut deadline: Option<Instant> = None;
-    let mut seen_texts: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_texts = SeenTexts::new();
     let mut queued_lines: u64 = 0;
     // Set only when *this batcher* decides to stop accepting new
     // candidates (an in-progress --max-lines trip). Deliberately separate
@@ -314,6 +379,23 @@ async fn run_batcher(mut rx_lines: mpsc::Receiver<(u64, Event)>, ctx: Arc<Ctx>) 
     let flush_after = Duration::from_millis(ctx.flush_ms.max(1));
 
     loop {
+        if ctx.abort.load(Ordering::Relaxed) {
+            // A Ctrl-C or a fatal/strict worker error already fired: stop
+            // waiting on new input immediately rather than racing it
+            // against whatever is next in `rx_lines` (a `biased` select
+            // always prefers a ready `rx_lines.recv()`, which would keep
+            // dispatching -- and paying for -- further requests). Flush
+            // whatever is currently buffered: any candidates in it are
+            // reported unjudged by `dispatch_window`'s own abort check
+            // below, never with a fresh API call. This is deliberately
+            // different from --max-lines/--max-files, which only ever set
+            // `ctx.shutdown` (never `ctx.abort`) and rely on the `None`
+            // branch below to drain the channel naturally so no
+            // already-buffered file event is lost.
+            close_and_dispatch(&mut window, &ctx, true).await;
+            break;
+        }
+
         let sleep = async {
             match deadline {
                 Some(d) => tokio::time::sleep_until(d.into()).await,
@@ -415,10 +497,20 @@ async fn run_batcher(mut rx_lines: mpsc::Receiver<(u64, Event)>, ctx: Arc<Ctx>) 
                                     }
                                 }
 
-                                if window.buffer.is_empty() {
+                                // Arm the flush deadline only when this row
+                                // actually gives the window its first
+                                // pending candidate. Arming it on any
+                                // buffer-was-empty transition would also
+                                // fire for a window holding nothing but
+                                // blank rows or already-`asked` context
+                                // rows (candidate_count() == 0), waking an
+                                // otherwise-idle stream every --flush-ms for
+                                // nothing.
+                                let had_no_candidates = window.candidate_count() == 0;
+                                window.buffer.push(PendingRow { seq, lineno, raw, judge_text, is_blank, asked: false });
+                                if !is_blank && had_no_candidates && deadline.is_none() {
                                     deadline = Some(Instant::now() + flush_after);
                                 }
-                                window.buffer.push(PendingRow { seq, lineno, raw, judge_text, is_blank, asked: false });
                                 if is_blank && window.candidate_count() == 0
                                     && window.buffer.len() > ctx.judge_context
                                 {
@@ -436,7 +528,7 @@ async fn run_batcher(mut rx_lines: mpsc::Receiver<(u64, Event)>, ctx: Arc<Ctx>) 
                                 while window.ready_to_close(ctx.batch_size, ctx.max_batch_bytes) {
                                     let Some((cand_end, cut)) = window.compute_cut(ctx.batch_size, ctx.judge_context, false) else { break };
                                     dispatch_window(&mut window, &ctx, cand_end, cut).await;
-                                    deadline = if window.buffer.is_empty() { None } else { Some(Instant::now() + flush_after) };
+                                    deadline = if window.candidate_count() == 0 { None } else { Some(Instant::now() + flush_after) };
                                 }
                             }
                         }
@@ -450,7 +542,7 @@ async fn run_batcher(mut rx_lines: mpsc::Receiver<(u64, Event)>, ctx: Arc<Ctx>) 
 
             _ = sleep, if deadline.is_some() => {
                 close_and_dispatch(&mut window, &ctx, false).await;
-                deadline = if window.buffer.is_empty() { None } else { Some(Instant::now() + flush_after) };
+                deadline = if window.candidate_count() == 0 { None } else { Some(Instant::now() + flush_after) };
             }
 
             // Ctrl-C (or a --strict/fatal worker error) explicitly wakes us
@@ -459,11 +551,12 @@ async fn run_batcher(mut rx_lines: mpsc::Receiver<(u64, Event)>, ctx: Arc<Ctx>) 
             // quiet stdin). --max-files/--max-lines don't notify: they let
             // the channel drain and close naturally, which is what lets
             // every already-buffered file event (and the direct-sent
-            // `Stopped` notice) survive instead of racing this exit.
-            _ = ctx.shutdown_notify.notified() => {
-                close_and_dispatch(&mut window, &ctx, true).await;
-                break;
-            }
+            // `Stopped` notice) survive instead of racing this exit. The
+            // actual drain-and-break happens via the `ctx.abort` check at
+            // the top of the loop (set alongside every `notify_one()`
+            // call); this arm only needs to break out of a blocked
+            // `rx_lines.recv()` so that check gets a chance to run.
+            _ = ctx.shutdown_notify.notified() => {}
         }
     }
 }
@@ -491,10 +584,22 @@ async fn dispatch_window(window: &mut FileWindow, ctx: &Arc<Ctx>, cand_end: usiz
     let slice = &window.buffer[..cut];
 
     let mut rows: Vec<Row> = Vec::with_capacity(cut);
-    let mut targets: Vec<(u64, u64, String)> = Vec::new(); // (seq, lineno, raw) per candidate, in row order
+    // (index into `rows`, seq, lineno, raw) per candidate. The judge keys
+    // its per-row outcomes by absolute position in `rows` (context rows
+    // included), which need not equal a candidate's ordinal position among
+    // *other candidates* -- a leading `asked` row retained purely for
+    // context (or, before this row index was tracked explicitly, a skipped
+    // blank) can sit ahead of it in `rows`. Recording the real index here
+    // is what keeps a verdict from ever landing on the wrong line.
+    let mut targets: Vec<(usize, u64, u64, String)> = Vec::new();
 
     for (i, r) in slice.iter().enumerate() {
-        if !r.is_blank && !r.asked && i < cand_end {
+        if r.is_blank {
+            // Blank lines carry nothing worth judging or showing as
+            // context -- never send them to jev, in either role.
+            continue;
+        }
+        if !r.asked && i < cand_end {
             let before: Vec<&str> = slice[i.saturating_sub(ctx.judge_context)..i]
                 .iter()
                 .map(|p| p.judge_text.as_str())
@@ -509,12 +614,13 @@ async fn dispatch_window(window: &mut FileWindow, ctx: &Arc<Ctx>, cand_end: usiz
             } else {
                 Some(serde_json::to_string(&(&before, &r.judge_text, &after)).unwrap_or_default())
             };
+            let row_idx = rows.len();
             rows.push(Row {
                 text: r.judge_text.clone(),
                 candidate: true,
                 cache_key,
             });
-            targets.push((r.seq, r.lineno, r.raw.clone()));
+            targets.push((row_idx, r.seq, r.lineno, r.raw.clone()));
         } else {
             rows.push(Row {
                 text: r.judge_text.clone(),
@@ -546,6 +652,28 @@ async fn dispatch_window(window: &mut FileWindow, ctx: &Arc<Ctx>, cand_end: usiz
         Ok(p) => p,
         Err(_) => return,
     };
+
+    if ctx.abort.load(Ordering::Relaxed) {
+        // A Ctrl-C or a fatal/strict worker error already fired (it may
+        // well have happened while we were waiting for the permit just
+        // above). Don't fire off another API request -- report every
+        // candidate as unjudged instead, so its seq is never left as a gap
+        // for the reorder buffer downstream.
+        drop(permit);
+        for (_, seq, lineno, raw) in targets {
+            let item = EmitItem::Line {
+                lineno,
+                raw,
+                verdict: None,
+                judged: true,
+            };
+            if ctx.tx_emit.send((seq, item)).await.is_err() {
+                return;
+            }
+        }
+        return;
+    }
+
     let ctx = ctx.clone();
     let query = ctx.query.clone();
     tokio::spawn(async move {
@@ -553,8 +681,8 @@ async fn dispatch_window(window: &mut FileWindow, ctx: &Arc<Ctx>, cand_end: usiz
         let outcomes = ctx.judge.judge_rows(&query, &rows).await;
         let mut printed_batch_err = false;
 
-        for (pos, (seq, lineno, raw)) in targets.into_iter().enumerate() {
-            let item = match outcomes.get(&pos) {
+        for (row_idx, seq, lineno, raw) in targets.into_iter() {
+            let item = match outcomes.get(&row_idx) {
                 Some(Ok(LineOutcome::Verdict(v))) => {
                     let is_match = if ctx.invert_match {
                         v.probability < ctx.threshold
@@ -573,6 +701,7 @@ async fn dispatch_window(window: &mut FileWindow, ctx: &Arc<Ctx>, cand_end: usiz
                     ctx.had_error.store(true, Ordering::Relaxed);
                     if ctx.strict {
                         ctx.shutdown.store(true, Ordering::Relaxed);
+                        ctx.abort.store(true, Ordering::Relaxed);
                         ctx.shutdown_notify.notify_one();
                     }
                     EmitItem::Line {
@@ -590,6 +719,7 @@ async fn dispatch_window(window: &mut FileWindow, ctx: &Arc<Ctx>, cand_end: usiz
                     ctx.had_error.store(true, Ordering::Relaxed);
                     if ctx.strict || e.fatal {
                         ctx.shutdown.store(true, Ordering::Relaxed);
+                        ctx.abort.store(true, Ordering::Relaxed);
                         ctx.shutdown_notify.notify_one();
                     }
                     EmitItem::Line {
