@@ -1,0 +1,20 @@
+Sep 19 08:00:01 mbp-eric kernel[0]: wifi0 deauth reason=3 (auth expired)
+Sep 19 08:00:15 mbp-eric cron[123]: (root) CMD (run-parts /etc/cron.hourly)
+Sep 19 08:01:02 mbp-eric networkd[78]: en0 link state changed to DOWN
+Sep 19 08:01:30 mbp-eric backupd[456]: starting scheduled Time Machine backup
+Sep 19 08:02:00 mbp-eric networkd[78]: connection to gateway 192.168.1.1 timed out
+Sep 19 08:02:45 mbp-eric sshd[901]: Accepted publickey for eric from 10.0.0.5 port 51322
+Sep 19 08:03:10 mbp-eric dhclient[234]: DHCPREQUEST failed, no lease obtained on en0
+Sep 19 08:03:50 mbp-eric loginwindow[12]: user eric logged in on console
+Sep 19 08:04:20 mbp-eric networkd[78]: no route to host 8.8.8.8
+Sep 19 08:05:00 mbp-eric diskarbitrationd[45]: disk1s1 mounted at /Volumes/Data
+Sep 19 08:05:33 mbp-eric resolved[67]: DNS resolution failed for api.typesafe.ai
+Sep 19 08:06:05 mbp-eric mds[89]: Spotlight metadata index rebuild started
+Sep 19 08:06:45 mbp-eric airportd[91]: en0 disassociated from SSID HomeNet, signal lost
+Sep 19 08:07:20 mbp-eric syslogd[1]: log rotation completed, 3 files archived
+Sep 19 08:07:55 mbp-eric timed[33]: system clock synced with time.apple.com
+Sep 19 08:08:30 mbp-eric softwareupdated[22]: no new updates available
+Sep 19 08:09:00 mbp-eric vpnd[144]: PPP connection dropped, retrying handshake
+Sep 19 08:09:40 mbp-eric bluetoothd[55]: paired with Magic Keyboard
+Sep 19 08:10:10 mbp-eric networkd[78]: packet loss 42% detected on en0, link unstable
+Sep 19 08:10:50 mbp-eric powerd[9]: battery at 20%, entering low power mode

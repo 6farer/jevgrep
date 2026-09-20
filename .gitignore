@@ -1,3 +1,6 @@
 /target
 .env
+
+# Stray logs, but the test fixtures are part of the repo
 *.log
+!fixtures/*.log

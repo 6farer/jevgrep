@@ -1,0 +1,20 @@
+{
+  "_comment": "Sidecar for network.log. Records which lines a human would judge to match the query below. Line numbers are 1-indexed, matching jevtail's --json \"lineno\" field. Tests build their mock TypeSafe responder from this file so the mocked judgments track human expectation instead of a hardcoded keyword rule.",
+  "fixture": "network.log",
+  "query": "network connectivity problems",
+  "total_lines": 20,
+  "matching_lines": [1, 3, 5, 7, 9, 11, 13, 17, 19],
+  "matching_reasons": {
+    "1": "wifi deauth (dropped association)",
+    "3": "en0 link state changed to DOWN",
+    "5": "gateway connection timed out",
+    "7": "DHCP lease failure, no address obtained",
+    "9": "no route to host",
+    "11": "DNS resolution failure",
+    "13": "wifi disassociation, signal lost",
+    "17": "VPN connection dropped",
+    "19": "packet loss / unstable link"
+  },
+  "non_matching_lines": [2, 4, 6, 8, 10, 12, 14, 15, 16, 18, 20],
+  "non_matching_reasons": "cron, backup, ssh login, user login, disk mount, spotlight indexing, log rotation, clock sync, software update check, bluetooth pairing, battery/power state -- none are network connectivity problems"
+}
