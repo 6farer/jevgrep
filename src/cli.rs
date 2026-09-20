@@ -1,4 +1,4 @@
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, Subcommand};
 
 /// jevgrep: grep (ripgrep-flavoured) where the pattern is a natural-language
 /// query judged by the TypeSafe "System One" API.
@@ -8,11 +8,16 @@ use clap::{ArgAction, Parser};
     version,
     about,
     disable_help_flag = true,
-    disable_help_subcommand = true
+    disable_help_subcommand = true,
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true
 )]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Natural-language description of the lines to find.
-    pub query: String,
+    pub query: Option<String>,
 
     /// Files or directories to search. No path: read stdin if it is not a
     /// terminal, otherwise search `.`. A path of `-` means stdin.
@@ -103,6 +108,26 @@ pub struct Cli {
         help_heading = "Judging"
     )]
     pub concurrency: usize,
+
+    /// Max time a line waits for its batch to fill before it is dispatched
+    /// anyway (bounds latency for a slow/live producer).
+    #[arg(
+        long,
+        default_value_t = 200,
+        value_name = "MS",
+        help_heading = "Judging"
+    )]
+    pub flush_ms: u64,
+
+    /// Max bytes of line text per API request (the API caps tokens per
+    /// request; long lines hit it before --batch does).
+    #[arg(
+        long,
+        default_value_t = 49_152,
+        value_name = "BYTES",
+        help_heading = "Judging"
+    )]
+    pub max_batch_bytes: usize,
 
     /// Disable the identical-(line+context) verdict cache.
     #[arg(long, help_heading = "Judging")]
@@ -221,4 +246,25 @@ impl Cli {
         let after = self.after_context.max(self.context);
         (before, after)
     }
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Manage the local config file (API key).
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ConfigAction {
+    /// Store the TypeSafe API key in the config file. Reads the key from
+    /// the argument, or from stdin (prompted, hidden, when stdin is a
+    /// terminal).
+    SetKey { key: Option<String> },
+    /// Print the config path and whether a key is set (masked).
+    Show,
+    /// Print the config file path.
+    Path,
 }

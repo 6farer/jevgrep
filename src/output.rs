@@ -137,19 +137,16 @@ struct JsonLine<'a> {
     lineno: u64,
     line: &'a str,
     probability: f64,
-    confidence: f64,
 }
 
-pub fn print_json(f: &FileLines, confidence_by_line: &std::collections::HashMap<u64, f64>) {
+pub fn print_json(f: &FileLines) {
     for &(lineno, probability) in f.matched {
         let text = &f.raw_by_lineno[(lineno - 1) as usize];
-        let confidence = confidence_by_line.get(&lineno).copied().unwrap_or(0.0);
         let j = JsonLine {
             file: f.label,
             lineno,
             line: text,
             probability,
-            confidence,
         };
         if let Ok(s) = serde_json::to_string(&j) {
             println!("{s}");

@@ -18,7 +18,6 @@ const CACHE_CAP: usize = 10_000;
 #[derive(Debug, Clone, Copy)]
 pub struct Verdict {
     pub probability: f64,
-    pub confidence: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -230,10 +229,7 @@ pub fn plan(file_args: Vec<FileArg>, params: &PlanParams) -> Result<PlanResult> 
                     file_idx,
                     lineno,
                     raw,
-                    kind: RecordKind::Free(Verdict {
-                        probability: 0.0,
-                        confidence: 1.0,
-                    }),
+                    kind: RecordKind::Free(Verdict { probability: 0.0 }),
                 });
                 free_count += 1;
                 continue;

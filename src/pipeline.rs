@@ -14,7 +14,7 @@ use anyhow::Result;
 use futures::stream::{self, StreamExt};
 
 use crate::cli::Cli;
-use crate::judge::{AskItem, Judge, LineOutcome};
+use crate::judge::{Judge, LineOutcome, Row};
 use crate::lines::{self, FileMeta, PlanParams, RecordKind, TruncKind, Verdict};
 use crate::output::{self, FileLines, FormatParams, Printer};
 use crate::walk;
@@ -115,7 +115,10 @@ pub async fn run(cli: &Cli, judge: Arc<Judge>, shutdown: Arc<AtomicBool>) -> Res
         }
     }
 
-    let query = cli.query.as_str();
+    let query = cli
+        .query
+        .as_deref()
+        .expect("query presence validated in main before pipeline::run is called");
     let judge_ref: &Judge = judge.as_ref();
     let records_ref = &plan.records;
 
@@ -164,63 +167,69 @@ pub async fn run(cli: &Cli, judge: Arc<Judge>, shutdown: Arc<AtomicBool>) -> Res
         &mut total_matches,
     );
 
+    // NOTE: this is a transitional adapter onto the new `Judge::judge_rows`
+    // API (Phase 1 of the streaming port). It intentionally does not send
+    // judge-context rows (no `  ~| ` neighbours) -- the whole plan-based
+    // batching this drives is replaced in Phase 2 by the streaming
+    // source/batcher, which is what actually reconstructs context as block
+    // rows. `judge_context_is_sent_in_the_request` is expected to fail
+    // until then.
     let mut result_stream = stream::iter(batches.iter().enumerate())
         .map(|(bidx, chunk)| {
-            let items: Vec<AskItem> = chunk
+            let rows: Vec<Row> = chunk
                 .iter()
                 .map(|&ri| match &records_ref[ri].kind {
-                    RecordKind::Ask {
-                        key,
-                        before,
-                        line,
-                        after,
-                    } => AskItem {
-                        key,
-                        before,
-                        line,
-                        after,
+                    RecordKind::Ask { key, line, .. } => Row {
+                        text: line.clone(),
+                        candidate: true,
+                        cache_key: Some(key.clone()),
                     },
                     _ => unreachable!("batch only contains Ask records"),
                 })
                 .collect();
             async move {
-                let outcome = judge_ref.judge_batch(query, &items).await;
+                let outcome = judge_ref.judge_rows(query, &rows).await;
                 (bidx, chunk, outcome)
             }
         })
         .buffered(cli.concurrency.max(1));
 
-    while let Some((bidx, chunk, outcome)) = result_stream.next().await {
-        match outcome {
-            Ok(map) => {
-                for &ri in chunk {
-                    let rec = &records_ref[ri];
-                    let key = match &rec.kind {
-                        RecordKind::Ask { key, .. } => key.as_str(),
-                        _ => unreachable!(),
-                    };
-                    match map.get(key) {
-                        Some(LineOutcome::Verdict(v)) => {
-                            verdict_by_key.insert(key, *v);
-                        }
-                        Some(LineOutcome::MissingAnswer) | None => {
-                            eprintln!(
-                                "jevgrep: no answer from TypeSafe API for {}:{}",
-                                plan.files[rec.file_idx].label, rec.lineno
-                            );
-                            had_error = true;
-                            if cli.strict {
-                                stop_now = true;
-                            }
-                        }
+    while let Some((bidx, chunk, mut outcome)) = result_stream.next().await {
+        let mut batch_err: Option<crate::judge::BatchError> = None;
+        for (pos, &ri) in chunk.iter().enumerate() {
+            let rec = &records_ref[ri];
+            let key = match &rec.kind {
+                RecordKind::Ask { key, .. } => key.as_str(),
+                _ => unreachable!(),
+            };
+            match outcome.remove(&pos) {
+                Some(Ok(LineOutcome::Verdict(v))) => {
+                    verdict_by_key.insert(
+                        key,
+                        crate::lines::Verdict {
+                            probability: v.probability,
+                        },
+                    );
+                }
+                Some(Ok(LineOutcome::MissingAnswer)) | None => {
+                    eprintln!(
+                        "jevgrep: no answer from TypeSafe API for {}:{}",
+                        plan.files[rec.file_idx].label, rec.lineno
+                    );
+                    had_error = true;
+                    if cli.strict {
+                        stop_now = true;
                     }
                 }
-            }
-            Err(e) => {
-                eprintln!("jevgrep: {e}");
-                had_error = true;
-                if cli.strict || e.fatal {
-                    stop_now = true;
+                Some(Err(e)) => {
+                    if batch_err.is_none() {
+                        eprintln!("jevgrep: {e}");
+                    }
+                    had_error = true;
+                    if cli.strict || e.fatal {
+                        stop_now = true;
+                    }
+                    batch_err = Some(e);
                 }
             }
         }
@@ -299,7 +308,6 @@ fn emit_file(
 ) {
     let raw_by_lineno: Vec<String> = records.iter().map(|r| r.raw.clone()).collect();
     let mut matched: Vec<(u64, f64)> = Vec::new();
-    let mut confidence_by_line: HashMap<u64, f64> = HashMap::new();
 
     for r in records {
         let verdict = match &r.kind {
@@ -317,7 +325,6 @@ fn emit_file(
         };
         if is_match {
             matched.push((r.lineno, v.probability));
-            confidence_by_line.insert(r.lineno, v.confidence);
         }
     }
 
@@ -331,7 +338,7 @@ fn emit_file(
     };
 
     if cli.json {
-        output::print_json(&file_lines, &confidence_by_line);
+        output::print_json(&file_lines);
     } else if cli.files_with_matches {
         output::print_files_with_matches(&file_lines);
     } else if cli.files_without_match {
